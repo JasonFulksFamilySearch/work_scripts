@@ -1,0 +1,23 @@
+# Homebrew Cask Exclusions
+#
+# Add one cask name per line to exclude it from automatic upgrades
+# These are typically packages managed by IT/MDM systems
+#
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+#
+# Default exclusions (already in script):
+# - docker-desktop
+# - visual-studio-code
+# - intellij-idea
+# - slack
+#
+# To use this file:
+# 1. Copy this file to: ~/scripts/.brew-exclude-casks
+# 2. Add your custom exclusions below
+# 3. Remove the example entries (or uncomment if you need them)
+
+# Example custom exclusions (remove these and add your own):
+# microsoft-teams
+# zoom
+# google-chrome

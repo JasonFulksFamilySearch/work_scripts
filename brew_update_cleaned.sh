@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+set -euo pipefail  # Exit on error, undefined vars, pipeline failures
+
+# Set Homebrew automation mode
+export NONINTERACTIVE=1
+export HOMEBREW_NO_AUTO_UPDATE=1  # We control updates
+
+################################################################################
+# Enhanced Homebrew Update Script with Sudo Management
+# - Sudo availability detection (pre-flight check)
+# - IT-managed cask exclusion (avoids sudo prompts)
+# - Separate upgrade paths for sudo-available vs sudo-blocked
+# - Preview before upgrade
+# - Detailed logging (update, sudo requests, IT-managed packages)
+# - Error handling and timing information
+# - Summary statistics and Brewfile backup
+# - Dry-run mode support
+#
+# KB0137814: Company policy blocks sudo for Homebrew upgrades
+# This script automatically handles IT-managed packages that require sudo
+################################################################################
+
+# Parse command line arguments
+DRY_RUN=false
+if [[ "${1:-}" == "--dry-run" || "${1:-}" == "-n" ]]; then
+    DRY_RUN=true
+fi
+
+# Log file locations
+LOGFILE="$HOME/brew-update.log"
+SUDO_LOGFILE="$HOME/brew-sudo-requests.log"
+IT_MANAGED_LOGFILE="$HOME/brew-it-managed-packages.log"
+BREWFILE_BACKUP="$HOME/Brewfile.backup"
+
+# ANSI color codes
+GREEN='\033[0;32m'
+YELLOW='\033[38;5;208m'
+RED='\033[0;31m'
+BLUE='\033[38;5;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No color / reset
+
+# IT-managed casks that require sudo (typically installed by MDM)
+# These will be excluded from Homebrew upgrades
+IT_MANAGED_CASKS=(
+    "docker-desktop"
+    "visual-studio-code"
+    "intellij-idea"
+    "slack"
+)
+
+# Load additional exclusions from config file if it exists
+EXCLUDE_CONFIG="$HOME/scripts/.brew-exclude-casks"
+if [ -f "$EXCLUDE_CONFIG" ]; then
+    while IFS= read -r cask; do
+        # Skip empty lines and comments
+        [[ -z "$cask" || "$cask" =~ ^#.*$ ]] && continue
+        IT_MANAGED_CASKS+=("$cask")
+    done < "$EXCLUDE_CONFIG"
+fi
+
+# Track start time
+START_TIME=$(date +%s)
+
+# Function to print bordered messages
+print_message() {
+    local COLOR=$1
+    local MESSAGE=$2
+    echo -e "${COLOR}######################################${NC}"
+    echo -e "${COLOR}### ${MESSAGE}${NC}"
+    echo -e "${COLOR}######################################${NC}"
+}
+
+# Function to print section headers
+print_section() {
+    echo ""
+    echo -e "${CYAN}────────────────────────────────────────${NC}"
+    echo -e "${CYAN}$1${NC}"
+    echo -e "${CYAN}────────────────────────────────────────${NC}"
+}
+
+# Function to check if a command succeeded
+check_status() {
+    if [ $? -ne 0 ]; then
+        print_message "${RED}" "ERROR: $1 failed!"
+        echo "Error occurred at: $(date)" >> "$LOGFILE"
+        exit 1
+    fi
+}
+
+# Function to log skipped IT-managed casks
+log_skipped_casks() {
+    local skipped_casks="$1"
+
+    if [ -z "$skipped_casks" ]; then
+        return
+    fi
+
+    {
+        echo "======================================"
+        echo "IT-Managed Packages Skipped: $(date)"
+        echo "======================================"
+        echo ""
+        echo "The following casks were skipped because they require sudo"
+        echo "and are likely managed by company IT/MDM systems:"
+        echo ""
+        echo "$skipped_casks"
+        echo ""
+        echo "These packages must be updated through:"
+        echo "  1. Company Self Service/Managed Software Center"
+        echo "  2. IT support ticket"
+        echo "  3. Manual download/install (if permitted)"
+        echo ""
+        echo "Reference: KB0137814 (sudo restrictions)"
+        echo "======================================"
+        echo ""
+    } >> "$IT_MANAGED_LOGFILE"
+
+    echo -e "${YELLOW}Skipped IT-managed casks logged to:${NC} $IT_MANAGED_LOGFILE"
+}
+
+# Function to check if cask is IT-managed (O(1) lookup)
+is_it_managed() {
+    local cask=$1
+    [[ -n "${IT_CASK_MAP[$cask]:-}" ]] && return 0
+    return 1
+}
+
+# Function to safely append to log file
+log_message() {
+    local message=$1
+    local logfile=${2:-"$LOGFILE"}
+    echo "$message" >> "$logfile" 2>/dev/null || true
+}
+
+# Dry run mode notification
+if [ "$DRY_RUN" = true ]; then
+    print_message "${MAGENTA}" "DRY RUN MODE - No changes will be made"
+    echo "This will show what would happen without actually doing it."
+    echo ""
+fi
+
+################################################################################
+# Pre-flight: Check sudo availability
+################################################################################
+SUDO_AVAILABLE=false
+# Test sudo without triggering set -e (commands in if conditions are exempt)
+if sudo -n true 2>/dev/null; then
+    SUDO_AVAILABLE=true
+    echo -e "${GREEN}✓ Sudo access available${NC}"
+else
+    echo -e "${YELLOW}⚠ Sudo access blocked (company policy KB0137814)${NC}"
+    echo -e "${YELLOW}  Cask upgrades requiring sudo will be skipped${NC}"
+    echo -e "${YELLOW}  Only formulae (CLI tools) will be upgraded${NC}"
+    echo ""
+fi
+
+# Starting Homebrew update process
+print_message "${YELLOW}" "Starting Homebrew Update Process"
+{
+    echo "========================================"
+    echo "Homebrew Update: $(date)"
+    echo "========================================"
+    echo ""
+} > "$LOGFILE"
+
+################################################################################
+# STEP 1: Backup current Brewfile
+################################################################################
+print_section "Creating Brewfile Backup"
+echo -e "${YELLOW}Saving current package list for rollback safety...${NC}"
+if [ "$DRY_RUN" = false ]; then
+    brew bundle dump --file="$BREWFILE_BACKUP" --force 2>&1 | tee -a "$LOGFILE"
+    check_status "Brewfile backup"
+    echo -e "${GREEN}✓ Backup saved to: $BREWFILE_BACKUP${NC}"
+    echo "Brewfile backup created: $(date)" >> "$LOGFILE"
+else
+    echo -e "${BLUE}[DRY RUN] Would create Brewfile backup at: $BREWFILE_BACKUP${NC}"
+fi
+
+################################################################################
+# STEP 2: Run Homebrew Doctor
+################################################################################
+print_section "Running Homebrew Doctor"
+# Capture output and status separately (doctor may return non-zero for warnings)
+set +e  # Temporarily disable exit on error for doctor check
+doctor_output=$(brew doctor 2>&1)
+doctor_status=$?
+set -e  # Re-enable exit on error
+
+if [ $doctor_status -eq 0 ]; then
+    echo -e "${GREEN}✓ Homebrew is healthy!${NC}"
+    echo "brew doctor: OK" >> "$LOGFILE"
+elif echo "$doctor_output" | grep -q "Your system is ready to brew"; then
+    echo -e "${GREEN}✓ Your system is ready to brew${NC}"
+    echo "brew doctor: ready to brew" >> "$LOGFILE"
+else
+    echo -e "${YELLOW}⚠ Homebrew doctor found some issues:${NC}"
+    echo "$doctor_output" | tee -a "$LOGFILE"
+
+    # Check for critical issues
+    if echo "$doctor_output" | grep -qi "error\|fatal\|critical"; then
+        print_message "${RED}" "CRITICAL ISSUES DETECTED!"
+        echo -e "${YELLOW}Review the issues above before proceeding.${NC}"
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Aborted by user" | tee -a "$LOGFILE"
+            exit 1
+        fi
+    fi
+fi
+
+################################################################################
+# STEP 3: Update Homebrew
+################################################################################
+print_section "Updating Homebrew"
+echo -e "${YELLOW}Fetching latest package information...${NC}"
+if [ "$DRY_RUN" = false ]; then
+    set +e  # Temporarily disable for tee pipeline
+    update_output=$(brew update 2>&1 | tee -a "$LOGFILE")
+    update_status=$?
+    set -e
+    if [ $update_status -ne 0 ]; then
+        print_message "${RED}" "ERROR: brew update failed!"
+        echo "Error occurred at: $(date)" >> "$LOGFILE"
+        exit 1
+    fi
+
+    if echo "$update_output" | grep -q "Already up-to-date"; then
+        echo -e "${GREEN}✓ Homebrew is already up-to-date${NC}"
+    else
+        echo -e "${GREEN}✓ Homebrew updated successfully${NC}"
+    fi
+else
+    echo -e "${BLUE}[DRY RUN] Would run: brew update${NC}"
+fi
+
+################################################################################
+# STEP 4: Preview Outdated Packages
+################################################################################
+print_section "Checking for Outdated Packages"
+
+# Single JSON call (faster, more reliable)
+OUTDATED_JSON=$(brew outdated --json=v2 --greedy 2>/dev/null)
+
+# Check if jq is available for parsing
+if command -v jq >/dev/null 2>&1; then
+    # Modern approach with jq
+    formulae_count=$(echo "$OUTDATED_JSON" | jq '.formulae | length')
+    casks_count=$(echo "$OUTDATED_JSON" | jq '.casks | length')
+
+    # Format for display (matches current output format)
+    outdated_formulae=$(echo "$OUTDATED_JSON" | jq -r '.formulae[] | "\(.name) \(.installed_versions[0]) -> \(.current_version)"')
+    outdated_casks=$(echo "$OUTDATED_JSON" | jq -r '.casks[] | "\(.name) \(.installed_versions[0]) -> \(.current_version)"')
+else
+    # Fallback to text parsing if jq not available
+    echo -e "${YELLOW}Note: Install jq for better performance (brew install jq)${NC}"
+    outdated_formulae=$(brew outdated --formula 2>/dev/null)
+    outdated_casks=$(brew outdated --cask --greedy 2>/dev/null)
+
+    # Count packages more robustly
+    if [ -z "$outdated_formulae" ]; then
+        formulae_count=0
+    else
+        formulae_count=$(echo "$outdated_formulae" | grep -c '^' || true)
+        formulae_count=${formulae_count:-0}
+    fi
+
+    if [ -z "$outdated_casks" ]; then
+        casks_count=0
+    else
+        casks_count=$(echo "$outdated_casks" | grep -c '^' || true)
+        casks_count=${casks_count:-0}
+    fi
+fi
+
+total_outdated=$((formulae_count + casks_count))
+
+if [ $total_outdated -eq 0 ]; then
+    print_message "${GREEN}" "All packages are up-to-date!"
+    echo "No outdated packages found: $(date)" >> "$LOGFILE"
+
+    # Skip to cleanup if nothing to upgrade
+    print_section "Cleaning up"
+    if [ "$DRY_RUN" = false ]; then
+        cleanup_output=$(brew cleanup -s 2>&1)
+        echo "$cleanup_output" >> "$LOGFILE"
+
+        # Extract disk space saved
+        space_saved=$(echo "$cleanup_output" | grep -o "[0-9.]*[KMGT]B" | tail -1)
+        if [ -n "$space_saved" ]; then
+            echo -e "${GREEN}✓ Cleanup complete - freed: $space_saved${NC}"
+        else
+            echo -e "${GREEN}✓ Cleanup complete${NC}"
+        fi
+    else
+        echo -e "${BLUE}[DRY RUN] Would run: brew cleanup -s${NC}"
+    fi
+
+    # Calculate elapsed time
+    END_TIME=$(date +%s)
+    ELAPSED=$((END_TIME - START_TIME))
+
+    print_message "${GREEN}" "Homebrew Update Complete"
+    echo -e "${CYAN}Total time: ${ELAPSED}s${NC}"
+    exit 0
+fi
+
+echo -e "${YELLOW}Found $total_outdated outdated package(s):${NC}"
+echo ""
+
+if [ $formulae_count -gt 0 ]; then
+    echo -e "${CYAN}Formulae ($formulae_count):${NC}"
+    echo "$outdated_formulae" | while read -r line; do
+        echo -e "  ${YELLOW}•${NC} $line"
+    done
+    echo ""
+fi
+
+if [ $casks_count -gt 0 ]; then
+    echo -e "${CYAN}Casks ($casks_count):${NC}"
+    echo "$outdated_casks" | while read -r line; do
+        echo -e "  ${YELLOW}•${NC} $line"
+    done
+    echo ""
+fi
+
+# Log outdated packages
+{
+    echo "Outdated packages before upgrade:"
+    echo "Formulae:"
+    echo "$outdated_formulae"
+    echo "Casks:"
+    echo "$outdated_casks"
+    echo ""
+} >> "$LOGFILE"
+
+if [ "$DRY_RUN" = true ]; then
+    print_message "${BLUE}" "DRY RUN: Would upgrade $total_outdated package(s)"
+    echo "Run without --dry-run to perform actual upgrade"
+    exit 0
+fi
+
+################################################################################
+# STEP 5: Upgrade Packages
+################################################################################
+print_section "Upgrading Packages"
+
+# Build fast lookup map for IT-managed casks (O(N) instead of O(N*M))
+declare -A IT_CASK_MAP
+for cask in "${IT_MANAGED_CASKS[@]}"; do
+    IT_CASK_MAP[$cask]=1
+done
+
+# Identify IT-managed casks that are outdated
+skipped_it_casks=""
+if [ $casks_count -gt 0 ]; then
+    if command -v jq >/dev/null 2>&1 && [ -n "$OUTDATED_JSON" ]; then
+        # With JSON (more efficient)
+        skipped_it_casks=$(echo "$OUTDATED_JSON" | jq -r '.casks[].name' | while read -r cask; do
+            [[ -n "${IT_CASK_MAP[$cask]:-}" ]] && echo "$cask" || true
+        done)
+    else
+        # With text fallback
+        skipped_it_casks=$(echo "$outdated_casks" | awk '{print $1}' | while read -r cask_name; do
+            [[ -n "${IT_CASK_MAP[$cask_name]:-}" ]] && echo "$cask_name" || true
+        done)
+    fi
+fi
+
+# Remove trailing newlines and empty lines
+skipped_it_casks=$(echo "$skipped_it_casks" | sed '/^$/d')
+
+if [ "$SUDO_AVAILABLE" = false ]; then
+    # Sudo blocked - only upgrade formulae
+    if [ $formulae_count -gt 0 ]; then
+        echo -e "${GREEN}Upgrading $formulae_count formulae (CLI tools)...${NC}" | tee -a "$LOGFILE"
+        echo -e "${YELLOW}Skipping casks due to sudo restrictions${NC}" | tee -a "$LOGFILE"
+        echo "" | tee -a "$LOGFILE"
+
+        set +e
+        brew upgrade --formula 2>&1 | tee -a "$LOGFILE"
+        upgrade_status=$?
+        set -e
+        if [ $upgrade_status -ne 0 ]; then
+            echo -e "${YELLOW}Warning: Some formula upgrades failed${NC}" | tee -a "$LOGFILE"
+        fi
+    else
+        echo -e "${YELLOW}No formulae to upgrade (casks skipped due to sudo restrictions)${NC}" | tee -a "$LOGFILE"
+        upgrade_status=0
+    fi
+
+    # Log all outdated casks as skipped
+    if [ $casks_count -gt 0 ]; then
+        log_skipped_casks "$outdated_casks"
+        echo ""
+        echo -e "${CYAN}Skipped Casks ($casks_count):${NC}"
+        echo "$outdated_casks" | while read -r line; do
+            cask_name=$(echo "$line" | awk '{print $1}')
+            echo -e "  ${YELLOW}⊘${NC} $line ${RED}(requires sudo)${NC}"
+        done | tee -a "$LOGFILE"
+    fi
+else
+    # Sudo available - upgrade with exclusions
+    echo -e "${GREEN}Upgrading packages (excluding IT-managed casks)...${NC}" | tee -a "$LOGFILE"
+
+    # Show exclusions if any
+    if [ -n "$skipped_it_casks" ]; then
+        echo -e "${YELLOW}Excluding IT-managed casks:${NC}" | tee -a "$LOGFILE"
+        echo -e "$skipped_it_casks" | while read -r cask; do
+            [ -n "$cask" ] && echo -e "  ${YELLOW}⊘${NC} $cask"
+        done | tee -a "$LOGFILE"
+        echo "" | tee -a "$LOGFILE"
+    fi
+
+    # Create a temporary file to track the upgrade process line by line
+    UPGRADE_LOG=$(mktemp) || {
+        print_message "${RED}" "ERROR: Failed to create temp file"
+        echo "Check /tmp directory permissions" | tee -a "$LOGFILE"
+        exit 1
+    }
+    current_package=""
+    upgrade_status=0
+
+    # Upgrade formulae first
+    if [ $formulae_count -gt 0 ]; then
+        echo -e "${CYAN}Upgrading formulae...${NC}" | tee -a "$LOGFILE"
+        set +e
+        brew upgrade --formula 2>&1 | tee -a "$UPGRADE_LOG" | while IFS= read -r line; do
+            echo "$line" >> "$LOGFILE"
+
+            if echo "$line" | grep -q "^==>"; then
+                current_package=$(echo "$line" | sed 's/^==> //')
+                echo -e "${BLUE}Processing: $current_package${NC}"
+            fi
+
+            # More precise regex to avoid false positives
+            if echo "$line" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
+                echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST!${NC}"
+                [ -n "$current_package" ] && echo -e "${YELLOW}Package: ${RED}$current_package${NC}"
+            fi
+        done
+        brew_exit_status=${PIPESTATUS[0]}
+        set -e
+        if [ $brew_exit_status -ne 0 ]; then
+            upgrade_status=1
+            echo -e "${YELLOW}Warning: Some formula upgrades failed${NC}" | tee -a "$LOGFILE"
+        fi
+    fi
+
+    # Upgrade casks individually, excluding IT-managed ones
+    if [ $casks_count -gt 0 ]; then
+        echo "" | tee -a "$LOGFILE"
+        echo -e "${CYAN}Upgrading casks (excluding IT-managed)...${NC}" | tee -a "$LOGFILE"
+
+        # Add progress counter for visual feedback
+        current=0
+        total=$(echo "$outdated_casks" | wc -l | tr -d ' ')
+
+        echo "$outdated_casks" | while read -r cask_line; do
+            cask_name=$(echo "$cask_line" | awk '{print $1}')
+            ((current++)) || true
+
+            # Skip if in IT-managed list (O(1) lookup with associative array)
+            if [[ -n "${IT_CASK_MAP[$cask_name]:-}" ]]; then
+                echo -e "${CYAN}[$current/$total]${NC} ${YELLOW}Skipping: $cask_name (IT-managed)${NC}" | tee -a "$LOGFILE"
+                continue
+            fi
+
+            # Show progress
+            echo -e "${CYAN}[$current/$total]${NC} Upgrading $cask_name..." | tee -a "$LOGFILE"
+
+            # Upgrade this cask (temporarily disable set -e to capture errors)
+            set +e
+            brew upgrade --cask "$cask_name" --greedy 2>&1 | tee -a "$UPGRADE_LOG" | while IFS= read -r line; do
+                echo "$line" >> "$LOGFILE"
+
+                if echo "$line" | grep -q "^==>"; then
+                    current_package=$(echo "$line" | sed 's/^==> //')
+                    echo -e "${BLUE}Processing: $current_package${NC}"
+                fi
+
+                # More precise regex to avoid false positives
+                if echo "$line" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
+                    echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST!${NC}"
+                    [ -n "$current_package" ] && echo -e "${YELLOW}Package: ${RED}$current_package${NC}"
+                fi
+            done
+            brew_exit_status=${PIPESTATUS[0]}
+            set -e
+
+            if [ $brew_exit_status -ne 0 ]; then
+                upgrade_status=1
+                echo -e "${YELLOW}Warning: Failed to upgrade $cask_name${NC}" | tee -a "$LOGFILE"
+            fi
+        done
+    fi
+
+    # Log excluded casks if any
+    if [ -n "$skipped_it_casks" ]; then
+        log_skipped_casks "$skipped_it_casks"
+    fi
+fi
+
+# Analyze the upgrade output for sudo requests (only if sudo was available)
+if [ "$SUDO_AVAILABLE" = true ] && [ -f "$UPGRADE_LOG" ]; then
+    # More precise regex to avoid false positives
+    if grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)' "$UPGRADE_LOG"; then
+        print_message "${RED}" "UNEXPECTED SUDO REQUEST DETECTED!"
+
+        # Try to identify the specific package
+        sudo_package=$(grep -B 5 -E '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)' "$UPGRADE_LOG" 2>/dev/null | grep "^==>" | tail -1 | sed 's/^==> //' | sed 's/ .*//' || echo "")
+
+        if [ -n "$sudo_package" ]; then
+            echo -e "${YELLOW}Package that requested sudo: ${RED}$sudo_package${NC}"
+            echo -e "${YELLOW}Consider adding this to IT_MANAGED_CASKS array${NC}"
+        else
+            echo -e "${YELLOW}Could not definitively identify package, check log for details${NC}"
+        fi
+
+        # Log to dedicated sudo log file
+        {
+            echo "======================================"
+            echo "Sudo Request Detected: $(date)"
+            echo "======================================"
+            if [ -n "$sudo_package" ]; then
+                echo "Likely package: $sudo_package"
+                echo ""
+            fi
+            echo "Full upgrade output:"
+            cat "$UPGRADE_LOG"
+            echo ""
+            echo "All outdated packages at time of request:"
+            echo "Formulae:"
+            echo "$outdated_formulae"
+            echo "Casks:"
+            echo "$outdated_casks"
+            echo ""
+            echo "======================================"
+            echo ""
+        } >> "$SUDO_LOGFILE"
+
+        echo -e "${BLUE}Details logged to: $SUDO_LOGFILE${NC}"
+        echo -e "${YELLOW}Please share this file with IT:${NC}"
+        if [ -n "$sudo_package" ]; then
+            echo -e "${YELLOW}  Package: ${RED}$sudo_package${NC}"
+        fi
+        echo -e "${YELLOW}  Log: ${BLUE}$SUDO_LOGFILE${NC}"
+        echo ""
+    fi
+fi
+
+# Clean up temp file after sudo detection (only if it was created)
+if [ -n "${UPGRADE_LOG:-}" ] && [ -f "${UPGRADE_LOG:-}" ]; then
+    rm -f "$UPGRADE_LOG"
+fi
+
+# Note: Don't exit here - let the script complete summary and cleanup
+# We'll report errors at the end
+
+################################################################################
+# STEP 6: Summary of Changes
+################################################################################
+print_section "Summary of Changes"
+
+# Cache brew list output once (more efficient than two separate calls)
+ALL_FORMULAE=$(brew list --versions --formula 2>/dev/null || true)
+ALL_CASKS=$(brew list --versions --cask 2>/dev/null || true)
+
+# Get list of what was upgraded (reuse cached data)
+upgraded_formulae=$(if [ -n "$ALL_FORMULAE" ]; then
+    echo "$ALL_FORMULAE" | while read -r name versions; do
+        if echo "$outdated_formulae" | grep -q "^$name " 2>/dev/null; then
+            latest=$(echo "$versions" | awk '{print $NF}')
+            echo "$name → $latest"
+        fi
+    done
+fi || true)
+
+upgraded_casks=$(if [ -n "$ALL_CASKS" ]; then
+    echo "$ALL_CASKS" | while read -r name versions; do
+        if echo "$outdated_casks" | grep -q "^$name " 2>/dev/null; then
+            latest=$(echo "$versions" | awk '{print $NF}')
+            echo "$name → $latest"
+        fi
+    done
+fi || true)
+
+# Count upgraded packages more robustly
+if [ -z "$upgraded_formulae" ]; then
+    upgraded_formulae_count=0
+else
+    upgraded_formulae_count=$(echo "$upgraded_formulae" | grep -c '^' 2>/dev/null || echo 0)
+fi
+
+if [ -z "$upgraded_casks" ]; then
+    upgraded_casks_count=0
+else
+    upgraded_casks_count=$(echo "$upgraded_casks" | grep -c '^' 2>/dev/null || echo 0)
+fi
+
+if [ "$upgraded_formulae_count" -gt 0 ]; then
+    echo -e "${GREEN}Upgraded Formulae ($upgraded_formulae_count):${NC}"
+    echo "$upgraded_formulae" | while read -r line; do
+        echo -e "  ${GREEN}✓${NC} $line"
+    done | tee -a "$LOGFILE"
+    echo ""
+fi
+
+if [ "$upgraded_casks_count" -gt 0 ]; then
+    echo -e "${GREEN}Upgraded Casks ($upgraded_casks_count):${NC}"
+    echo "$upgraded_casks" | while read -r line; do
+        echo -e "  ${GREEN}✓${NC} $line"
+    done | tee -a "$LOGFILE"
+    echo ""
+fi
+
+if [ "$upgraded_formulae_count" -eq 0 ] && [ "$upgraded_casks_count" -eq 0 ]; then
+    echo -e "${YELLOW}No packages were upgraded${NC}" | tee -a "$LOGFILE" || true
+    echo ""
+fi
+
+################################################################################
+# STEP 7: Cleanup
+################################################################################
+print_section "Cleaning up"
+echo -e "${YELLOW}Removing old versions and clearing cache...${NC}"
+
+cleanup_output=$(brew cleanup -s 2>&1 || true)
+echo "$cleanup_output" >> "$LOGFILE"
+
+# Extract disk space saved
+space_saved=$(echo "$cleanup_output" | grep -o "[0-9.]*[KMGT]B" | tail -1 || echo "")
+if [ -n "$space_saved" ]; then
+    echo -e "${GREEN}✓ Cleanup complete - freed: $space_saved${NC}"
+else
+    echo -e "${GREEN}✓ Cleanup complete${NC}"
+fi
+
+################################################################################
+# FINAL SUMMARY
+################################################################################
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+MINUTES=$((ELAPSED / 60))
+SECONDS=$((ELAPSED % 60))
+
+echo ""
+print_message "${GREEN}" "Homebrew Update Complete"
+echo ""
+echo -e "${CYAN}═══════════════════════════════════════${NC}"
+echo -e "${CYAN}           FINAL SUMMARY${NC}"
+echo -e "${CYAN}═══════════════════════════════════════${NC}"
+echo -e "${YELLOW}Total packages upgraded:${NC} $((upgraded_formulae_count + upgraded_casks_count))"
+echo -e "${YELLOW}  • Formulae:${NC} $upgraded_formulae_count"
+echo -e "${YELLOW}  • Casks:${NC} $upgraded_casks_count"
+if [ -n "$space_saved" ]; then
+    echo -e "${YELLOW}Disk space freed:${NC} $space_saved"
+fi
+if [ $MINUTES -gt 0 ]; then
+    echo -e "${YELLOW}Total time:${NC} ${MINUTES}m ${SECONDS}s"
+else
+    echo -e "${YELLOW}Total time:${NC} ${SECONDS}s"
+fi
+echo -e "${YELLOW}Log file:${NC} $LOGFILE"
+echo -e "${YELLOW}Brewfile backup:${NC} $BREWFILE_BACKUP"
+
+# IT-managed packages notice if any were skipped
+if [ -f "$IT_MANAGED_LOGFILE" ] && grep -q "IT-Managed Packages Skipped: $(date +%Y-%m-%d)" "$IT_MANAGED_LOGFILE"; then
+    echo ""
+    echo -e "${YELLOW}⚠ IT-MANAGED PACKAGES SKIPPED${NC}"
+    skipped_count=$(grep -c "IT-Managed Packages Skipped" "$IT_MANAGED_LOGFILE" | tail -1)
+    echo -e "${YELLOW}Review:${NC} $IT_MANAGED_LOGFILE"
+    echo -e "${YELLOW}These packages must be updated through IT/MDM systems${NC}"
+fi
+
+# Sudo warning if detected (unexpected)
+if [ -f "$SUDO_LOGFILE" ] && grep -q "Sudo Request Detected: $(date +%Y-%m-%d)" "$SUDO_LOGFILE"; then
+    echo ""
+    echo -e "${RED}⚠ UNEXPECTED SUDO REQUESTS DETECTED${NC}"
+    echo -e "${YELLOW}Review:${NC} $SUDO_LOGFILE"
+    echo -e "${YELLOW}Share this file with IT to identify the problematic package${NC}"
+fi
+
+echo -e "${CYAN}═══════════════════════════════════════${NC}"
+echo ""
+
+# Report upgrade errors if any occurred
+if [ $upgrade_status -ne 0 ]; then
+    echo -e "${RED}⚠ SOME UPGRADES FAILED${NC}"
+    echo -e "${YELLOW}Check $LOGFILE for details${NC}"
+    echo -e "${YELLOW}Failed casks may need manual intervention${NC}"
+    echo ""
+fi
+
+# Log final summary
+{
+    echo ""
+    echo "========================================"
+    echo "Update completed: $(date)"
+    echo "Total packages upgraded: $((upgraded_formulae_count + upgraded_casks_count))"
+    echo "Time elapsed: ${ELAPSED}s"
+    if [ $upgrade_status -ne 0 ]; then
+        echo "Status: Completed with errors"
+    else
+        echo "Status: Success"
+    fi
+    echo "========================================"
+} >> "$LOGFILE"
+
+# Exit with appropriate status code
+exit $upgrade_status

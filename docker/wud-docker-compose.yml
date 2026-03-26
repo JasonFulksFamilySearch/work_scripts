@@ -1,0 +1,53 @@
+
+version: "3.8"
+
+services:
+  wud:
+    image: getwud/wud:latest
+    container_name: wud
+    restart: unless-stopped
+
+    ports:
+      - "3000:3000"   # Web UI → http://localhost:3000
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    environment:
+      # ------------------------------------------------------------
+      # SLACK NOTIFICATION TRIGGER
+      # ------------------------------------------------------------
+      # Provider: SLACK
+      # Trigger name: NOTIFY
+      # Settings:
+      #   WEBHOOK       → Slack Incoming Webhook URL
+      #   AUTO          → true = send automatically when updates found
+      #   MODE          → batch = one consolidated message
+      #   BATCHTITLE    → Slack message title
+      #   BATCHBODY     → Slack message body (templated)
+      #
+      # WUD trigger naming pattern confirmed here:
+      # https://github.com/getwud/wud/issues/784  (provider list, env scheme)
+      #
+      # Slack incoming webhook behavior:
+      # https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/
+      #
+      # Title support in Slack trigger added in WUD release 8.1.0:
+      # https://github.com/getwud/wud/releases
+      # ------------------------------------------------------------
+
+      WUD_TRIGGER_SLACK_NOTIFY_WEBHOOK: "https://hooks.slack.com/services/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"
+      WUD_TRIGGER_SLACK_NOTIFY_AUTO: "true"
+      WUD_TRIGGER_SLACK_NOTIFY_MODE: "batch"
+
+
+      WUD_TRIGGER_SLACK_NOTIFY_BATCHTITLE: "🔔 WUD: $${containers.length} update(s) available"
+
+      WUD_TRIGGER_SLACK_NOTIFY_BATCHBODY: |
+        $${containers.map(c =>
+          `• *$${c.name}* — $${c.image.shortName}:$${c.image.localTag} → $${c.image.remoteTag || 'newer tag'} ($${c.updateKind.localValue} → $${c.updateKind.remoteValue})`
+        ).join('\n')}
+
+
+      # OPTIONAL: Change scan frequency (default: automatic)
+      # WUD_TRIGGER_POLL_INTERVAL: "6h"

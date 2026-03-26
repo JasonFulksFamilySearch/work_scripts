@@ -1,0 +1,63 @@
+
+version: "3.8"
+
+# Compose stack for pgAdmin built from your container inspect.
+# - Ports: 5050:80
+# - Bind mount: /Users/fulksjas/pgadmin-backup -> /var/lib/pgadmin
+# - Env: PGADMIN_DEFAULT_EMAIL / PGADMIN_DEFAULT_PASSWORD / PYTHONPATH
+# - Network: default bridge
+# - Healthcheck + log options for stability
+
+services:
+  pgadmin:
+    image: dpage/pgadmin4:latest             # previously 9.7; "latest" so WUD can update
+    container_name: pgadmin_container
+    restart: unless-stopped
+
+    # Same port mapping as your current container (5050 -> 80)
+    ports:
+      - "5050:80"
+
+    # Environment variables copied from inspect
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "jason.fulks@familysearch.org"
+      PGADMIN_DEFAULT_PASSWORD: "CHANGE_ME_AFTER_MIGRATION"   # rotate this! (was visible in JSON)
+      PYTHONPATH: "/pgadmin4"
+
+      # Optional: set timezone for consistent logging
+      # TZ: "America/Boise"
+
+    # Persist pgAdmin config (server definitions, prefs, etc.)
+    # Bind mount mirrors your current container exactly:
+    volumes:
+      - /Users/fulksjas/pgadmin-backup:/var/lib/pgadmin
+
+      # Alternatively (recommended), use a named volume to avoid macOS path permissions:
+      # - pgadmin_data:/var/lib/pgadmin
+
+    # Match your current default bridge network (no extra config required)
+    networks:
+      - default
+
+    # Keep logs tidy and avoid giant json logs on long-running services
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # A basic healthcheck so WUD/you can see readiness
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# Uncomment if you prefer a named volume instead of the host path
+# volumes:
+#   pgadmin_data:
+
+networks:
+  default:
+    driver: bridge
