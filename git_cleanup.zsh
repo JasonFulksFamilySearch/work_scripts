@@ -128,6 +128,7 @@ typeset -i STAT_API_CALLS=0
 # ── Default branch & dev-status availability ──
 typeset DEFAULT_BRANCH="master"
 typeset -i DEV_STATUS_AVAILABLE=1
+typeset GH_REPO=""  # owner/repo slug, detected in preflight
 
 # ── Done statuses (used by enrichment and decision matrix) ──
 DONE_STATUSES=("Done" "Closed" "Resolved" "Released" "Cancelled" "Won't Do" "Won't Fix")
@@ -138,6 +139,17 @@ EXCLUDED_BRANCHES=("chore/pr-review")
 # ═══════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════
+
+_delete_remote_branch() {
+  local branch="$1"
+  if [[ -n "$GH_REPO" ]]; then
+    # URL-encode slashes in branch name (e.g., feat/ARC-1234 → feat%2FARC-1234)
+    local encoded_branch="${branch//\//%2F}"
+    gh api --method DELETE "repos/${GH_REPO}/git/refs/heads/${encoded_branch}" 2>/dev/null
+  else
+    git push origin --delete --no-verify "$branch" 2>/dev/null
+  fi
+}
 
 extract_jira_ticket() {
   local branch_name="$1"
@@ -232,6 +244,14 @@ preflight() {
     fi
   fi
   info "  Default branch: $DEFAULT_BRANCH"
+
+  # Detect GitHub repo slug for gh API calls
+  GH_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+  if [[ -n "$GH_REPO" ]]; then
+    info "  GitHub repo: $GH_REPO"
+  else
+    warn "  $WARN Could not detect GitHub repo — remote branch deletion will fall back to git push"
+  fi
 }
 
 # ═══════════════════════════════════════════════
@@ -537,6 +557,41 @@ discover_branches() {
     _add_branch_record "$branch" "$br_type" "" "$on_remote" "$merged" "n/a" "n/a"
   done
 
+  # ── Scan remote-only branches (only those where we were last committer) ──
+  local my_email
+  my_email=$(git config user.email)
+
+  local ref_line ref_short ref_email branch_name
+  while IFS=$'\t' read -r ref_short ref_email; do
+    branch_name="${ref_short#origin/}"
+
+    [[ "$branch_name" == "HEAD" ]] && continue
+    [[ "$branch_name" == "$ref_short" ]] && continue
+    [[ "$branch_name" == "$current_branch" ]] && continue
+    [[ "$branch_name" == "$DEFAULT_BRANCH" ]] && continue
+
+    # Only include branches where we were the last committer
+    [[ "$ref_email" != "$my_email" ]] && continue
+
+    # Skip excluded branches
+    local is_excluded=0
+    for excl in "${EXCLUDED_BRANCHES[@]}"; do
+      [[ "$branch_name" == "$excl" ]] && { is_excluded=1; break; }
+    done
+    [[ $is_excluded -eq 1 ]] && continue
+
+    # Skip branches already discovered (have a local branch)
+    if git show-ref --verify --quiet "refs/heads/$branch_name"; then
+      continue
+    fi
+
+    local merged="no"
+    git merge-base --is-ancestor "origin/$branch_name" "$DEFAULT_BRANCH" 2>/dev/null && merged="yes"
+
+    _add_branch_record "$branch_name" "remote-only" "" "yes" "$merged" "n/a" "n/a"
+    STAT_REMOTE_ONLY=$((STAT_REMOTE_ONLY + 1))
+  done < <(git for-each-ref --format='%(refname:short)%09%(authoremail:trim)' refs/remotes/origin/)
+
   STAT_BRANCHES_SCANNED=${#BR_NAME[@]}
 
   # Count branches with tickets
@@ -545,7 +600,7 @@ discover_branches() {
     [[ -n "$t" ]] && ticket_count=$((ticket_count + 1))
   done
 
-  success "  $GOOD Found ${STAT_BRANCHES_SCANNED} branch(es) (${STAT_WORKTREES_SCANNED} worktrees, ${ticket_count} with JIRA tickets)"
+  success "  $GOOD Found ${STAT_BRANCHES_SCANNED} branch(es) (${STAT_WORKTREES_SCANNED} worktrees, ${STAT_REMOTE_ONLY} remote-only, ${ticket_count} with JIRA tickets)"
 }
 
 enrich_jira() {
@@ -678,9 +733,15 @@ apply_decision_matrix() {
     pr_open="${BR_PR_OPEN[$i]:-0}"
     pr_declined="${BR_PR_DECLINED[$i]:-0}"
 
-    # Determine delete scope based on remote presence
-    base_scope="local"
-    [[ "$on_remote" == "yes" ]] && base_scope="local+remote"
+    # Determine delete scope based on branch type and remote presence
+    local br_type="${BR_TYPE[$i]}"
+    if [[ "$br_type" == "remote-only" ]]; then
+      base_scope="remote"
+    elif [[ "$on_remote" == "yes" ]]; then
+      base_scope="local+remote"
+    else
+      base_scope="local"
+    fi
 
     # Decision logic in priority order
     if [[ "$dir_missing" == "yes" ]]; then
@@ -732,15 +793,22 @@ apply_decision_matrix() {
       if [[ "$on_remote" == "no" ]] || [[ "$merged" == "yes" ]]; then
         recommendation="DELETE"
         reason="No JIRA ticket; not on remote / merged into $DEFAULT_BRANCH"
-        scope="local"
+        scope="$base_scope"
       else
         recommendation="KEEP"
         reason="No JIRA ticket; still on remote, not merged"
       fi
 
     else
-      recommendation="KEEP"
-      reason="Insufficient data for recommendation"
+      # Ticket exists but JIRA returned no data — fall back to git heuristics
+      if [[ "$on_remote" == "no" ]] || [[ "$merged" == "yes" ]]; then
+        recommendation="DELETE"
+        reason="Ticket not found in JIRA; not on remote / merged into $DEFAULT_BRANCH"
+        scope="$base_scope"
+      else
+        recommendation="KEEP"
+        reason="Ticket not found in JIRA; still on remote, not merged"
+      fi
     fi
 
     BR_RECOMMENDATION[$i]="$recommendation"
@@ -772,20 +840,20 @@ print_report_table() {
   printf '\n' >&2
 
   # Column widths
-  local -i COL_NUM=4 COL_WT=4 COL_BRANCH=40 COL_TICKET=12 COL_STATUS=12 COL_PRS=12 COL_CHG=10 COL_ACT=6
+  local -i COL_NUM=4 COL_WT=4 COL_RMT=5 COL_BRANCH=40 COL_TICKET=12 COL_STATUS=12 COL_PRS=12 COL_CHG=10 COL_ACT=6
 
   # Table header
   printf '%b' "  ${BOLD}" >&2
-  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
-    "#" "WT" "Branch" "Ticket" "Status" "PRs(M/O/D)" "Changes" "Action" >&2
+  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_RMT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
+    "#" "WT" "Rmt" "Branch" "Ticket" "Status" "PRs(M/O/D)" "Changes" "Action" >&2
   printf '%b\n' "${RESETC}" >&2
 
   printf '  %b' "${GRAY}" >&2
-  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
-    "──" "──" "────────────────────────────────────────" "────────────" "────────────" "────────────" "──────────" "──────" >&2
+  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_RMT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
+    "──" "──" "───" "────────────────────────────────────────" "────────────" "────────────" "────────────" "──────────" "──────" >&2
   printf '%b\n' "${RESETC}" >&2
 
-  local branch_display ticket_display status_display pr_display changes_display wt_display
+  local branch_display ticket_display status_display pr_display changes_display wt_display rmt_display
   local rec action_color action_display
 
   for (( i=1; i <= total; i++ )); do
@@ -796,6 +864,14 @@ print_report_table() {
     # Worktree indicator column
     wt_display=""
     [[ "${BR_TYPE[$i]}" == "worktree" ]] && wt_display="✓"
+
+    # Remote indicator column
+    rmt_display=""
+    if [[ "${BR_ON_REMOTE[$i]}" == "yes" ]]; then
+      rmt_display="✓"
+    else
+      rmt_display="${RED}✗${RESETC}"
+    fi
 
     pr_display="--"
     if [[ -n "${BR_PR_MERGED[$i]}" ]]; then
@@ -817,6 +893,7 @@ print_report_table() {
     printf '  ' >&2
     printf "%-${COL_NUM}s " "$i" >&2
     printf "%-${COL_WT}s " "$wt_display" >&2
+    printf '%b%-4s' "$rmt_display" "" >&2
     printf "%-${COL_BRANCH}s " "$branch_display" >&2
     printf "%-${COL_TICKET}s " "$ticket_display" >&2
     printf "%-${COL_STATUS}s " "$status_display" >&2
@@ -828,8 +905,8 @@ print_report_table() {
 
   # Footer
   printf '  %b' "${GRAY}" >&2
-  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
-    "──" "──" "────────────────────────────────────────" "────────────" "────────────" "────────────" "──────────" "──────" >&2
+  printf "%-${COL_NUM}s %-${COL_WT}s %-${COL_RMT}s %-${COL_BRANCH}s %-${COL_TICKET}s %-${COL_STATUS}s %-${COL_PRS}s %-${COL_CHG}s %s" \
+    "──" "──" "───" "────────────────────────────────────────" "────────────" "────────────" "────────────" "──────────" "──────" >&2
   printf '%b\n' "${RESETC}" >&2
 
   printf '  %b\n' "${BOLD}Summary:${RESETC} ${RED}${STAT_RECOMMEND_DELETE} to delete${RESETC}, ${YELLOW}${STAT_RECOMMEND_WARN} warning(s)${RESETC}, ${GREEN}${STAT_RECOMMEND_KEEP} to keep${RESETC}" >&2
@@ -969,21 +1046,29 @@ walk_through_deletions() {
           fi
         fi
 
-        # Delete local branch
-        if git show-ref --verify --quiet "refs/heads/$branch"; then
+        # Delete local branch (skip for remote-only)
+        if [[ "$scope" != "remote" ]] && git show-ref --verify --quiet "refs/heads/$branch"; then
           action "    ${CLEANUP} Deleting local branch..."
           git branch -D "$branch" 2>/dev/null
           STAT_DELETED_LOCAL=$((STAT_DELETED_LOCAL + 1))
         fi
 
         # Delete remote branch if applicable
-        if [[ "$scope" == "local+remote" ]]; then
+        if [[ "$scope" == "local+remote" || "$scope" == "remote" ]]; then
           action "    ${CLEANUP} Deleting remote branch..."
-          if git push origin --delete "$branch" 2>/dev/null; then
+          if _delete_remote_branch "$branch"; then
             STAT_DELETED_REMOTE=$((STAT_DELETED_REMOTE + 1))
-            success "    $GOOD Deleted local + remote"
+            if [[ "$scope" == "remote" ]]; then
+              success "    $GOOD Deleted remote"
+            else
+              success "    $GOOD Deleted local + remote"
+            fi
           else
-            warn "    $WARN Deleted local, failed to delete remote"
+            if [[ "$scope" == "remote" ]]; then
+              warn "    $WARN Failed to delete remote"
+            else
+              warn "    $WARN Deleted local, failed to delete remote"
+            fi
           fi
         else
           success "    $GOOD Deleted local"
@@ -1011,9 +1096,9 @@ walk_through_deletions() {
         ;;
       [Rr])
         # Remote only
-        if [[ "$scope" == "local+remote" ]]; then
+        if [[ "$scope" == "local+remote" || "$scope" == "remote" ]]; then
           action "    ${CLEANUP} Deleting remote branch only..."
-          if git push origin --delete "$branch" 2>/dev/null; then
+          if _delete_remote_branch "$branch"; then
             STAT_DELETED_REMOTE=$((STAT_DELETED_REMOTE + 1))
             success "    $GOOD Deleted remote"
           else
@@ -1036,40 +1121,15 @@ walk_through_deletions() {
 # ═══════════════════════════════════════════════
 
 list_remote_only_branches() {
-  local current_branch
-  current_branch=$(git rev-parse --abbrev-ref HEAD)
-
-  local -a remote_only_names
-
-  for remote_branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/); do
-    local branch_name="${remote_branch#origin/}"
-
-    [[ "$branch_name" == "HEAD" ]] && continue
-    [[ "$branch_name" == "$remote_branch" ]] && continue
-    [[ "$branch_name" == "$current_branch" ]] && continue
-
-    if ! git show-ref --verify --quiet "refs/heads/$branch_name"; then
-      remote_only_names+=("$branch_name")
-    fi
-  done
-
-  local total=${#remote_only_names[@]}
-  STAT_REMOTE_ONLY=$total
-
-  if [[ $total -eq 0 ]]; then
+  # Remote-only branches are now included in Phase 1 discovery and the Phase 2 table.
+  # This phase just reports the count for visibility.
+  if [[ $STAT_REMOTE_ONLY -eq 0 ]]; then
     section_header "Phase 3: Remote-Only Branches" "$MAGNIFY" "All remote branches are tracked locally"
     success "  $GOOD Nothing to report."
-    return
+  else
+    section_header "Phase 3: Remote-Only Branches" "$MAGNIFY" "${STAT_REMOTE_ONLY} remote-only branch(es) included in Phase 2 analysis above"
+    success "  $GOOD Remote-only branches were analyzed and presented in the report table."
   fi
-
-  section_header "Phase 3: Remote-Only Branches" "$MAGNIFY" "${total} branch(es) exist on remote but not locally"
-
-  printf '\n' >&2
-  local num=0
-  for branch_name in "${remote_only_names[@]}"; do
-    num=$((num + 1))
-    printf '%b\n' "  ${GRAY}${num}.${RESETC} ${BLUE}${branch_name}${RESETC}" >&2
-  done
 }
 
 # ═══════════════════════════════════════════════
