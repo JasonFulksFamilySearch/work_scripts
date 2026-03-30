@@ -373,6 +373,9 @@ fi
 # Remove trailing newlines and empty lines
 skipped_it_casks=$(echo "$skipped_it_casks" | sed '/^$/d')
 
+upgraded_formula_list=""
+upgraded_cask_list=""
+
 if [ "$SUDO_AVAILABLE" = false ]; then
     # Sudo blocked - only upgrade formulae
     if [ $formulae_count -gt 0 ]; then
@@ -381,11 +384,17 @@ if [ "$SUDO_AVAILABLE" = false ]; then
         echo "" | tee -a "$LOGFILE"
 
         set +e
-        brew upgrade --formula 2>&1 | tee -a "$LOGFILE"
+        formula_output=$(brew upgrade --formula 2>&1)
         upgrade_status=$?
         set -e
+        echo "$formula_output" >> "$LOGFILE"
+
         if [ $upgrade_status -ne 0 ]; then
             echo -e "${YELLOW}Warning: Some formula upgrades failed${NC}" | tee -a "$LOGFILE"
+            echo "$formula_output" | sed 's/^/    /'
+        else
+            echo -e "${GREEN}✓ Formulae upgraded successfully${NC}"
+            upgraded_formula_list="$outdated_formulae"
         fi
     else
         echo -e "${YELLOW}No formulae to upgrade (casks skipped due to sudo restrictions)${NC}" | tee -a "$LOGFILE"
@@ -426,27 +435,27 @@ else
 
     # Upgrade formulae first
     if [ $formulae_count -gt 0 ]; then
-        echo -e "${CYAN}Upgrading formulae...${NC}" | tee -a "$LOGFILE"
+        echo -e "${CYAN}Upgrading $formulae_count formulae...${NC}" | tee -a "$LOGFILE"
         set +e
-        brew upgrade --formula 2>&1 | tee -a "$UPGRADE_LOG" | while IFS= read -r line; do
-            echo "$line" >> "$LOGFILE"
-
-            if echo "$line" | grep -q "^==>"; then
-                current_package=$(echo "$line" | sed 's/^==> //')
-                echo -e "${BLUE}Processing: $current_package${NC}"
-            fi
-
-            # More precise regex to avoid false positives
-            if echo "$line" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
-                echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST!${NC}"
-                [ -n "$current_package" ] && echo -e "${YELLOW}Package: ${RED}$current_package${NC}"
-            fi
-        done
-        brew_exit_status=${PIPESTATUS[0]}
+        formula_output=$(brew upgrade --formula 2>&1)
+        brew_exit_status=$?
         set -e
+        echo "$formula_output" >> "$LOGFILE"
+        echo "$formula_output" >> "$UPGRADE_LOG"
+
         if [ $brew_exit_status -ne 0 ]; then
             upgrade_status=1
             echo -e "${YELLOW}Warning: Some formula upgrades failed${NC}" | tee -a "$LOGFILE"
+            echo "$formula_output" | sed 's/^/    /'
+        else
+            echo -e "${GREEN}✓ Formulae upgraded successfully${NC}"
+            upgraded_formula_list="$outdated_formulae"
+        fi
+
+        # Check for unexpected sudo requests
+        if echo "$formula_output" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
+            echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST during formula upgrade!${NC}"
+            echo -e "${YELLOW}Check $LOGFILE for details${NC}"
         fi
     fi
 
@@ -459,7 +468,7 @@ else
         current=0
         total=$(echo "$outdated_casks" | wc -l | tr -d ' ')
 
-        echo "$outdated_casks" | while read -r cask_line; do
+        while read -r cask_line; do
             cask_name=$(echo "$cask_line" | awk '{print $1}')
             ((current++)) || true
 
@@ -472,30 +481,55 @@ else
             # Show progress
             echo -e "${CYAN}[$current/$total]${NC} Upgrading $cask_name..." | tee -a "$LOGFILE"
 
-            # Upgrade this cask (temporarily disable set -e to capture errors)
+            # Upgrade this cask
             set +e
-            brew upgrade --cask "$cask_name" --greedy 2>&1 | tee -a "$UPGRADE_LOG" | while IFS= read -r line; do
-                echo "$line" >> "$LOGFILE"
-
-                if echo "$line" | grep -q "^==>"; then
-                    current_package=$(echo "$line" | sed 's/^==> //')
-                    echo -e "${BLUE}Processing: $current_package${NC}"
-                fi
-
-                # More precise regex to avoid false positives
-                if echo "$line" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
-                    echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST!${NC}"
-                    [ -n "$current_package" ] && echo -e "${YELLOW}Package: ${RED}$current_package${NC}"
-                fi
-            done
-            brew_exit_status=${PIPESTATUS[0]}
+            cask_output=$(brew upgrade --cask "$cask_name" --greedy 2>&1)
+            brew_exit_status=$?
             set -e
+            echo "$cask_output" >> "$LOGFILE"
+            echo "$cask_output" >> "$UPGRADE_LOG"
 
             if [ $brew_exit_status -ne 0 ]; then
-                upgrade_status=1
-                echo -e "${YELLOW}Warning: Failed to upgrade $cask_name${NC}" | tee -a "$LOGFILE"
+                # Check for "already an App at" error — offer to force replace
+                if echo "$cask_output" | grep -q "It seems there is already an App at"; then
+                    echo -e "${YELLOW}  $cask_name: existing app detected in Caskroom${NC}"
+                    read -p "  Force replace $cask_name? (y/N): " -n 1 -r < /dev/tty
+                    echo
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        set +e
+                        cask_output=$(brew upgrade --cask "$cask_name" --greedy --force 2>&1)
+                        brew_exit_status=$?
+                        set -e
+                        echo "$cask_output" >> "$LOGFILE"
+                        echo "$cask_output" >> "$UPGRADE_LOG"
+
+                        if [ $brew_exit_status -eq 0 ]; then
+                            echo -e "${GREEN}  ✓ $cask_name force-upgraded${NC}"
+                            upgraded_cask_list+="$cask_name"$'\n'
+                        else
+                            upgrade_status=1
+                            echo -e "${RED}  Failed to force-upgrade $cask_name:${NC}" | tee -a "$LOGFILE"
+                            echo "$cask_output" | sed 's/^/    /'
+                        fi
+                    else
+                        upgrade_status=1
+                        echo -e "${YELLOW}  Skipped $cask_name${NC}" | tee -a "$LOGFILE"
+                    fi
+                else
+                    upgrade_status=1
+                    echo -e "${RED}  Failed to upgrade $cask_name:${NC}" | tee -a "$LOGFILE"
+                    echo "$cask_output" | sed 's/^/    /'
+                fi
+            else
+                echo -e "${GREEN}  ✓ $cask_name upgraded${NC}"
+                upgraded_cask_list+="$cask_name"$'\n'
             fi
-        done
+
+            # Check for unexpected sudo requests
+            if echo "$cask_output" | grep -qE '(Password:|sudo:|\[sudo\]|need.*administrator|require.*sudo)'; then
+                echo -e "${RED}⚠ UNEXPECTED SUDO REQUEST for $cask_name!${NC}"
+            fi
+        done <<< "$outdated_casks"
     fi
 
     # Log excluded casks if any
@@ -565,45 +599,26 @@ fi
 ################################################################################
 print_section "Summary of Changes"
 
-# Cache brew list output once (more efficient than two separate calls)
-ALL_FORMULAE=$(brew list --versions --formula 2>/dev/null || true)
-ALL_CASKS=$(brew list --versions --cask 2>/dev/null || true)
+# Trim trailing newlines from tracked lists
+upgraded_formula_list=$(echo "$upgraded_formula_list" | sed '/^$/d')
+upgraded_cask_list=$(echo "$upgraded_cask_list" | sed '/^$/d')
 
-# Get list of what was upgraded (reuse cached data)
-upgraded_formulae=$(if [ -n "$ALL_FORMULAE" ]; then
-    echo "$ALL_FORMULAE" | while read -r name versions; do
-        if echo "$outdated_formulae" | grep -q "^$name " 2>/dev/null; then
-            latest=$(echo "$versions" | awk '{print $NF}')
-            echo "$name → $latest"
-        fi
-    done
-fi || true)
-
-upgraded_casks=$(if [ -n "$ALL_CASKS" ]; then
-    echo "$ALL_CASKS" | while read -r name versions; do
-        if echo "$outdated_casks" | grep -q "^$name " 2>/dev/null; then
-            latest=$(echo "$versions" | awk '{print $NF}')
-            echo "$name → $latest"
-        fi
-    done
-fi || true)
-
-# Count upgraded packages more robustly
-if [ -z "$upgraded_formulae" ]; then
+# Count upgraded packages
+if [ -z "$upgraded_formula_list" ]; then
     upgraded_formulae_count=0
 else
-    upgraded_formulae_count=$(echo "$upgraded_formulae" | grep -c '^' 2>/dev/null || echo 0)
+    upgraded_formulae_count=$(echo "$upgraded_formula_list" | wc -l | tr -d ' ')
 fi
 
-if [ -z "$upgraded_casks" ]; then
+if [ -z "$upgraded_cask_list" ]; then
     upgraded_casks_count=0
 else
-    upgraded_casks_count=$(echo "$upgraded_casks" | grep -c '^' 2>/dev/null || echo 0)
+    upgraded_casks_count=$(echo "$upgraded_cask_list" | wc -l | tr -d ' ')
 fi
 
 if [ "$upgraded_formulae_count" -gt 0 ]; then
     echo -e "${GREEN}Upgraded Formulae ($upgraded_formulae_count):${NC}"
-    echo "$upgraded_formulae" | while read -r line; do
+    echo "$upgraded_formula_list" | while read -r line; do
         echo -e "  ${GREEN}✓${NC} $line"
     done | tee -a "$LOGFILE"
     echo ""
@@ -611,7 +626,7 @@ fi
 
 if [ "$upgraded_casks_count" -gt 0 ]; then
     echo -e "${GREEN}Upgraded Casks ($upgraded_casks_count):${NC}"
-    echo "$upgraded_casks" | while read -r line; do
+    echo "$upgraded_cask_list" | while read -r line; do
         echo -e "  ${GREEN}✓${NC} $line"
     done | tee -a "$LOGFILE"
     echo ""
