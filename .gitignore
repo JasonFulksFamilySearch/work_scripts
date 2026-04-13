@@ -1,2 +1,9 @@
+# macOS
 .DS_Store
+
+# Claude Code
 .claude/
+
+# User-specific config (the .example is tracked; the real file is not)
+config/brew/.brew-exclude-casks
+!config/brew/.brew-exclude-casks.example

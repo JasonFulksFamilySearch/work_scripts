@@ -13,7 +13,7 @@
 # - slack
 #
 # To use this file:
-# 1. Copy this file to: ~/scripts/.brew-exclude-casks
+# 1. Copy this file to: ~/developer-scripts/config/brew/.brew-exclude-casks
 # 2. Add your custom exclusions below
 # 3. Remove the example entries (or uncomment if you need them)
 

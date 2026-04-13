@@ -45,7 +45,7 @@ IT_MANAGED_CASKS=(
 )
 
 # Load additional exclusions from config file if it exists
-EXCLUDE_CONFIG="$HOME/scripts/.brew-exclude-casks"
+EXCLUDE_CONFIG="${DEV_SCRIPTS:-$HOME/developer-scripts}/config/brew/.brew-exclude-casks"
 if [ -f "$EXCLUDE_CONFIG" ]; then
     while IFS= read -r cask; do
         # Skip empty lines and comments
