@@ -44,9 +44,7 @@ After installation, these commands are available on your PATH:
 | `git-cleanup` | Multi-phase branch cleanup with JIRA dev-status integration | `gitCleanup` |
 | `git-worktree-create` | Create a git worktree (use via `workBranch` to auto-cd) | — |
 | `git-sync-master` | Fetch and merge master into current branch (worktree-safe) | `gitSyncMaster` |
-| `git-delete-my-branches` | Interactively delete your old remote branches | `gitDeleteMyRemoteBranches` |
 | `git-oldest-branches` | List remote branches sorted by age, color-coded | `gitOldest` |
-| `git-purge-stashes` | Purge all git stashes with confirmation | `gitStashesPurge` |
 | `git-diff` | Generate diff to file (`-b` branch name, `-s` staged, `-m` vs master) | `gitDiff` / `gitDiffS` |
 | `brew-update` | Safe Homebrew update with cask exclusions and dry-run | `brewUpdate` |
 | `code-climate` | Run CodeClimate analysis via Docker | `codeClimate` |

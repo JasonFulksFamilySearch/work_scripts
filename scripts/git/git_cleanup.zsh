@@ -1025,20 +1025,39 @@ walk_through_deletions() {
             git worktree prune
           else
             action "    ${CLEANUP} Removing worktree..."
-            if ! git worktree remove "$wt_path" 2>/dev/null; then
-              if [[ $auto_confirm -eq 1 ]]; then
-                warn "    $WARN Worktree has uncommitted changes — force removing..."
-                git worktree remove --force "$wt_path"
-              else
-                warn "    $WARN Worktree has uncommitted changes."
-                printf '%b' "    ${RED}${QUESTION} Force remove? (data loss!) [y/N]: ${RESETC}" >&2
+            local wt_err
+            wt_err=$(git worktree remove "$wt_path" 2>&1)
+            if [[ $? -ne 0 ]]; then
+              if [[ "$wt_err" == *"locked"* ]]; then
+                local lock_reason=""
+                if [[ "$wt_err" =~ "lock reason: ([^\n]+)" ]]; then
+                  lock_reason="${match[1]}"
+                fi
+                warn "    $WARN Worktree is locked${lock_reason:+: $lock_reason}"
+                printf '%b' "    ${RED}${QUESTION} Force remove locked worktree? (-f -f override) [y/N]: ${RESETC}" >&2
                 read -r force_confirm </dev/tty
                 if [[ "$force_confirm" =~ ^[Yy]$ ]]; then
-                  git worktree remove --force "$wt_path"
+                  git worktree remove --force --force "$wt_path"
                 else
                   warn "    Skipped"
                   STAT_SKIPPED=$((STAT_SKIPPED + 1))
                   continue
+                fi
+              else
+                if [[ $auto_confirm -eq 1 ]]; then
+                  warn "    $WARN Worktree has uncommitted changes — force removing..."
+                  git worktree remove --force "$wt_path"
+                else
+                  warn "    $WARN Worktree has uncommitted changes."
+                  printf '%b' "    ${RED}${QUESTION} Force remove? (data loss!) [y/N]: ${RESETC}" >&2
+                  read -r force_confirm </dev/tty
+                  if [[ "$force_confirm" =~ ^[Yy]$ ]]; then
+                    git worktree remove --force "$wt_path"
+                  else
+                    warn "    Skipped"
+                    STAT_SKIPPED=$((STAT_SKIPPED + 1))
+                    continue
+                  fi
                 fi
               fi
             fi

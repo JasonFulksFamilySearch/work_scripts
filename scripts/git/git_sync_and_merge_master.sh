@@ -148,6 +148,11 @@ else
     fi
   else
     warn "$WARN Merge conflicts detected. Please resolve conflicts manually."
+    if $stash_applied; then
+      warn "    $WARN Your work is still stashed as: $stash_name"
+      warn "    After resolving conflicts and committing, restore it with:"
+      info "    git stash pop"
+    fi
   fi
 fi
 fi
